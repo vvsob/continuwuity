@@ -21,7 +21,7 @@ use ruma::{
 };
 
 use self::data::{Data, ReceiptItem};
-use crate::{Dep, rooms, sending};
+use crate::{Dep, appservice, rooms, sending, sending::appservice_ephemeral};
 
 pub struct Service {
 	services: Services,
@@ -29,8 +29,10 @@ pub struct Service {
 }
 
 struct Services {
+	appservice: Dep<appservice::Service>,
 	sending: Dep<sending::Service>,
 	short: Dep<rooms::short::Service>,
+	state_cache: Dep<rooms::state_cache::Service>,
 	timeline: Dep<rooms::timeline::Service>,
 }
 
@@ -38,8 +40,10 @@ impl crate::Service for Service {
 	fn build(args: crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			services: Services {
+				appservice: args.depend::<appservice::Service>("appservice"),
 				sending: args.depend::<sending::Service>("sending"),
 				short: args.depend::<rooms::short::Service>("rooms::short"),
+				state_cache: args.depend::<rooms::state_cache::Service>("rooms::state_cache"),
 				timeline: args.depend::<rooms::timeline::Service>("rooms::timeline"),
 			},
 			db: Data::new(&args),
@@ -58,6 +62,9 @@ impl Service {
 		event: &ReceiptEvent,
 	) {
 		self.db.readreceipt_update(user_id, room_id, event).await;
+		self.appservice_send(room_id, event)
+			.await
+			.expect("appservice receipt send failed");
 		self.services
 			.sending
 			.flush_room(room_id)
@@ -138,6 +145,38 @@ impl Service {
 	#[inline]
 	pub async fn last_privateread_update(&self, user_id: &UserId, room_id: &RoomId) -> u64 {
 		self.db.last_privateread_update(user_id, room_id).await
+	}
+
+	async fn appservice_send(&self, room_id: &RoomId, event: &ReceiptEvent) -> Result<()> {
+		let receipt = appservice_ephemeral::receipt(event.content.clone(), room_id.to_owned());
+		let appservices = self
+			.services
+			.appservice
+			.read()
+			.await
+			.values()
+			.cloned()
+			.collect::<Vec<_>>();
+
+		for appservice in appservices {
+			if !appservice.registration.receive_ephemeral {
+				continue;
+			}
+
+			if self
+				.services
+				.state_cache
+				.appservice_in_room(room_id, &appservice)
+				.await
+			{
+				self.services.sending.send_ephemeral_appservice(
+					appservice.registration.id.clone(),
+					receipt.clone(),
+				)?;
+			}
+		}
+
+		Ok(())
 	}
 }
 

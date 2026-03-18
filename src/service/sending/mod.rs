@@ -1,4 +1,5 @@
 pub mod antispam;
+pub(crate) mod appservice_ephemeral;
 mod appservice;
 mod data;
 mod dest;
@@ -19,7 +20,9 @@ use conduwuit::{
 	warn,
 };
 use futures::{FutureExt, Stream, StreamExt};
-use ruma::{RoomId, ServerName, UserId, api::OutgoingRequest};
+use ruma::{
+	RoomId, ServerName, UserId, api::{OutgoingRequest, appservice::event::push_events::v1::EphemeralData},
+};
 use tokio::{task, task::JoinSet};
 
 use self::data::Data;
@@ -166,6 +169,23 @@ impl Service {
 	pub fn send_pdu_appservice(&self, appservice_id: String, pdu_id: RawPduId) -> Result {
 		let dest = Destination::Appservice(appservice_id);
 		let event = SendingEvent::Pdu(pdu_id);
+		let _cork = self.db.db.cork();
+		let keys = self.db.queue_requests(once((&event, &dest)));
+		self.dispatch(Msg {
+			dest,
+			event,
+			queue_id: keys.into_iter().next().expect("request queue key"),
+		})
+	}
+
+	#[tracing::instrument(skip(self, ephemeral), level = "debug")]
+	pub fn send_ephemeral_appservice(
+		&self,
+		appservice_id: String,
+		ephemeral: EphemeralData,
+	) -> Result {
+		let dest = Destination::Appservice(appservice_id);
+		let event = SendingEvent::Edu(appservice_ephemeral::serialize(&ephemeral)?);
 		let _cork = self.db.db.cork();
 		let keys = self.db.queue_requests(once((&event, &dest)));
 		self.dispatch(Msg {

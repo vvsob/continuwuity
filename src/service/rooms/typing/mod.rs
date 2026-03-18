@@ -12,7 +12,11 @@ use ruma::{
 };
 use tokio::sync::{RwLock, broadcast};
 
-use crate::{Dep, globals, sending, sending::EduBuf, users};
+use crate::{
+	Dep, appservice, globals, rooms, sending,
+	sending::{EduBuf, appservice_ephemeral},
+	users,
+};
 
 pub struct Service {
 	server: Arc<Server>,
@@ -25,7 +29,9 @@ pub struct Service {
 }
 
 struct Services {
+	appservice: Dep<appservice::Service>,
 	globals: Dep<globals::Service>,
+	state_cache: Dep<rooms::state_cache::Service>,
 	sending: Dep<sending::Service>,
 	users: Dep<users::Service>,
 }
@@ -35,7 +41,9 @@ impl crate::Service for Service {
 		Ok(Arc::new(Self {
 			server: args.server.clone(),
 			services: Services {
+				appservice: args.depend::<appservice::Service>("appservice"),
 				globals: args.depend::<globals::Service>("globals"),
+				state_cache: args.depend::<rooms::state_cache::Service>("rooms::state_cache"),
 				sending: args.depend::<sending::Service>("sending"),
 				users: args.depend::<users::Service>("users"),
 			},
@@ -75,6 +83,8 @@ impl Service {
 			trace!("receiver found what it was looking for and is no longer interested");
 		}
 
+		self.appservice_send(room_id).await?;
+
 		// update federation
 		if self.services.globals.user_is_local(user_id) {
 			self.federation_send(room_id, user_id, true).await?;
@@ -102,6 +112,8 @@ impl Service {
 		if self.typing_update_sender.send(room_id.to_owned()).is_err() {
 			trace!("receiver found what it was looking for and is no longer interested");
 		}
+
+		self.appservice_send(room_id).await?;
 
 		// update federation
 		if self.services.globals.user_is_local(user_id) {
@@ -156,6 +168,8 @@ impl Service {
 				trace!("receiver found what it was looking for and is no longer interested");
 			}
 
+			self.appservice_send(room_id).await?;
+
 			// update federation
 			for user in &removable {
 				if self.services.globals.user_is_local(user) {
@@ -165,6 +179,15 @@ impl Service {
 		}
 
 		Ok(())
+	}
+
+	async fn typing_users(&self, room_id: &RoomId) -> Vec<OwnedUserId> {
+		self.typing
+			.read()
+			.await
+			.get(room_id)
+			.map(|room| room.keys().cloned().collect())
+			.unwrap_or_default()
 	}
 
 	/// Returns the count of the last typing update in this room.
@@ -205,6 +228,41 @@ impl Service {
 			.await;
 
 		Ok(user_ids)
+	}
+
+	async fn appservice_send(&self, room_id: &RoomId) -> Result<()> {
+		let typing = appservice_ephemeral::typing(
+			room_id.to_owned(),
+			self.typing_users(room_id).await,
+		);
+		let appservices = self
+			.services
+			.appservice
+			.read()
+			.await
+			.values()
+			.cloned()
+			.collect::<Vec<_>>();
+
+		for appservice in appservices {
+			if !appservice.registration.receive_ephemeral {
+				continue;
+			}
+
+			if self
+				.services
+				.state_cache
+				.appservice_in_room(room_id, &appservice)
+				.await
+			{
+				self.services.sending.send_ephemeral_appservice(
+					appservice.registration.id.clone(),
+					typing.clone(),
+				)?;
+			}
+		}
+
+		Ok(())
 	}
 
 	/// Returns a new typing EDU.

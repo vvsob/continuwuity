@@ -14,7 +14,7 @@ use ruma::{OwnedUserId, UInt, UserId, events::presence::PresenceEvent, presence:
 use tokio::time::sleep;
 
 use self::{data::Data, presence::Presence};
-use crate::{Dep, globals, users};
+use crate::{Dep, appservice, globals, rooms, sending, sending::appservice_ephemeral, users};
 
 pub struct Service {
 	timer_channel: (Sender<TimerType>, Receiver<TimerType>),
@@ -26,9 +26,12 @@ pub struct Service {
 }
 
 struct Services {
+	appservice: Dep<appservice::Service>,
 	server: Arc<Server>,
 	db: Arc<Database>,
 	globals: Dep<globals::Service>,
+	sending: Dep<sending::Service>,
+	state_cache: Dep<rooms::state_cache::Service>,
 	users: Dep<users::Service>,
 }
 
@@ -47,9 +50,12 @@ impl crate::Service for Service {
 			offline_timeout: checked!(offline_timeout_s * 1_000)?,
 			db: Data::new(&args),
 			services: Services {
+				appservice: args.depend::<appservice::Service>("appservice"),
 				server: args.server.clone(),
 				db: args.db.clone(),
 				globals: args.depend::<globals::Service>("globals"),
+				sending: args.depend::<sending::Service>("sending"),
+				state_cache: args.depend::<rooms::state_cache::Service>("rooms::state_cache"),
 				users: args.depend::<users::Service>("users"),
 			},
 		}))
@@ -146,6 +152,8 @@ impl Service {
 		self.db
 			.set_presence(user_id, presence_state, currently_active, last_active_ago, status_msg)
 			.await?;
+
+		self.appservice_send(user_id).await?;
 
 		if (self.timeout_remote_users || self.services.globals.user_is_local(user_id))
 			&& user_id != self.services.globals.server_user
@@ -244,6 +252,39 @@ impl Service {
 			.await;
 
 		Ok(event)
+	}
+
+	async fn appservice_send(&self, user_id: &UserId) -> Result<()> {
+		let event = self.get_presence(user_id).await?;
+		let ephemeral = appservice_ephemeral::presence(event);
+		let appservices = self
+			.services
+			.appservice
+			.read()
+			.await
+			.values()
+			.cloned()
+			.collect::<Vec<_>>();
+
+		for appservice in appservices {
+			if !appservice.registration.receive_ephemeral {
+				continue;
+			}
+
+			if self
+				.services
+				.state_cache
+				.appservice_sees_user(user_id, &appservice)
+				.await
+			{
+				self.services.sending.send_ephemeral_appservice(
+					appservice.registration.id.clone(),
+					ephemeral.clone(),
+				)?;
+			}
+		}
+
+		Ok(())
 	}
 
 	async fn process_presence_timer(&self, user_id: &OwnedUserId) -> Result<()> {

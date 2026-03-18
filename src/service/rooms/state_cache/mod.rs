@@ -131,6 +131,25 @@ pub async fn appservice_in_room(&self, room_id: &RoomId, appservice: &Registrati
 }
 
 #[implement(Service)]
+#[tracing::instrument(level = "trace", skip_all)]
+pub async fn appservice_sees_user(&self, user_id: &UserId, appservice: &RegistrationInfo) -> bool {
+	if appservice.is_user_match(user_id) {
+		return true;
+	}
+
+	let rooms = self.rooms_joined(user_id);
+	pin_mut!(rooms);
+
+	while let Some(room_id) = rooms.next().await {
+		if self.appservice_in_room(room_id, appservice).await {
+			return true;
+		}
+	}
+
+	false
+}
+
+#[implement(Service)]
 pub fn get_appservice_in_room_cache_usage(&self) -> (usize, usize) {
 	let cache = self.appservice_in_room_cache.read();
 
